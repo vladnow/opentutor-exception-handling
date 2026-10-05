@@ -1,0 +1,1054 @@
+diff --git a/apps/api/libs/text_utils.py b/apps/api/libs/text_utils.py
+index 5bc9fda..f7c7172 100644
+--- a/apps/api/libs/text_utils.py
++++ b/apps/api/libs/text_utils.py
+@@ -1,8 +1,11 @@
+ """Shared text utilities for processing LLM responses."""
+ 
+ import json
++import logging
+ from typing import Any
+ 
++logger = logging.getLogger(__name__)
++
+ 
+ def strip_code_fences(text: str) -> str:
+     """Remove markdown code fences from LLM output.
+@@ -40,7 +43,7 @@ def parse_llm_json(text: str, *, default: Any = None) -> Any:
+     try:
+         return json.loads(cleaned)
+     except (json.JSONDecodeError, ValueError):
+-        pass
++        logger.debug("Direct LLM JSON parse failed; trying embedded JSON", exc_info=True)
+ 
+     # 2. Try to find a JSON array
+     arr_start = text.find("[")
+@@ -49,7 +52,7 @@ def parse_llm_json(text: str, *, default: Any = None) -> Any:
+         try:
+             return json.loads(text[arr_start:arr_end])
+         except (json.JSONDecodeError, ValueError):
+-            pass
++            logger.debug("Embedded LLM JSON array parse failed", exc_info=True)
+ 
+     # 3. Try to find a JSON object
+     obj_start = text.find("{")
+@@ -58,6 +61,6 @@ def parse_llm_json(text: str, *, default: Any = None) -> Any:
+         try:
+             return json.loads(text[obj_start:obj_end])
+         except (json.JSONDecodeError, ValueError):
+-            pass
++            logger.debug("Embedded LLM JSON object parse failed", exc_info=True)
+ 
+     return default
+diff --git a/apps/api/routers/canvas.py b/apps/api/routers/canvas.py
+index 2c358d6..06b05c1 100644
+--- a/apps/api/routers/canvas.py
++++ b/apps/api/routers/canvas.py
+@@ -62,7 +62,7 @@ async def canvas_login(
+     credentials in AuthSession.login_actions.
+     """
+     try:
+-        from playwright.async_api import async_playwright
++        from playwright.async_api import Error as PlaywrightError, async_playwright
+     except ImportError as exc:
+         raise ExternalServiceError(service="Canvas", message="Playwright is required for Canvas login but is not installed. Install with: pip install playwright && playwright install chromium") from exc
+     from routers.scrape import _default_session_name
+@@ -83,19 +83,12 @@ async def canvas_login(
+                 _canvas_actions(body.username, body.password),
+             )
+             await browser.close()
+-    except (OSError, RuntimeError, ConnectionError, TimeoutError) as exc:
++    except (PlaywrightError, OSError, RuntimeError) as exc:
++        logger.exception("Canvas browser login failed for session=%s", session_name)
+         raise ExternalServiceError(
+             service="Canvas",
+             message=f"Browser automation failed: {exc}",
+         ) from exc
+-    except Exception as exc:
+-        # Catch Playwright-specific errors (TimeoutError, Error, etc.)
+-        if "playwright" in type(exc).__module__:
+-            raise ExternalServiceError(
+-                service="Canvas",
+-                message=f"Browser automation failed: {exc}",
+-            ) from exc
+-        raise
+ 
+     if not success:
+         raise PermissionDeniedError("Canvas login failed")
+@@ -148,7 +141,7 @@ async def canvas_browser_login(
+     import asyncio
+ 
+     try:
+-        from playwright.async_api import async_playwright
++        from playwright.async_api import Error as PlaywrightError, async_playwright
+     except ImportError as exc:
+         raise ExternalServiceError(service="Canvas", message="Playwright is required for browser login but is not installed. Install with: pip install playwright && playwright install chromium") from exc
+     from routers.scrape import _default_session_name
+@@ -168,7 +161,8 @@ async def canvas_browser_login(
+             try:
+                 try:
+                     await page.goto(canvas_url, wait_until="domcontentloaded", timeout=30000)
+-                except Exception as nav_exc:
++                except PlaywrightError as nav_exc:
++                    logger.exception("Canvas navigation failed for session=%s", session_name)
+                     raise ExternalServiceError(
+                         service="Canvas",
+                         message=f"Failed to navigate to Canvas URL: {nav_exc}",
+@@ -265,7 +259,8 @@ async def canvas_browser_login(
+         raise
+     except PermissionDeniedError:
+         raise
+-    except Exception as exc:
++    except (PlaywrightError, OSError, RuntimeError) as exc:
++        logger.exception("Canvas interactive login failed for session=%s", session_name)
+         raise ExternalServiceError(
+             service="Canvas",
+             message=f"Browser automation failed: {exc}",
+diff --git a/apps/api/routers/courses_crud.py b/apps/api/routers/courses_crud.py
+index 3c04623..caa744a 100644
+--- a/apps/api/routers/courses_crud.py
++++ b/apps/api/routers/courses_crud.py
+@@ -19,6 +19,8 @@ from schemas.course import CourseCreate, CourseOverviewCard, CourseResponse, Con
+ from services.auth.dependency import get_current_user
+ from services.course_access import get_course_or_404
+ 
++from json import JSONDecodeError
++
+ logger = logging.getLogger(__name__)
+ 
+ router = APIRouter()
+@@ -245,7 +247,8 @@ async def update_layout(
+     """Update the workspace layout configuration stored in course metadata."""
+     try:
+         body = await request.json()
+-    except Exception:
++    except (JSONDecodeError, UnicodeDecodeError):
++        logger.warning("Invalid layout JSON for course=%s", course_id, exc_info=True)
+         body = {}
+     if not isinstance(body, dict):
+         body = {}
+diff --git a/apps/api/routers/onboarding.py b/apps/api/routers/onboarding.py
+index 6ae6f23..9603826 100644
+--- a/apps/api/routers/onboarding.py
++++ b/apps/api/routers/onboarding.py
+@@ -29,6 +29,8 @@ from services.block_decision.profile_mapper import profile_to_layout
+ from services.memory.pipeline import encode_memory
+ from services.templates.demo_course import DEMO_COURSE_NAME, seed_demo_course
+ 
++from services.llm.errors import LLM_ERRORS
++
+ logger = logging.getLogger(__name__)
+ router = APIRouter()
+ 
+@@ -108,13 +110,9 @@ async def interview_turn(
+     except (ValueError, KeyError, ConnectionError, OSError, RuntimeError) as exc:
+         logger.exception("Onboarding interview error: %s", exc)
+         raise HTTPException(status_code=502, detail="Interview agent failed") from exc
+-    except Exception as exc:
+-        # Catch LLM provider errors (openai.APIConnectionError, etc.)
+-        exc_module = getattr(type(exc), "__module__", "")
+-        if "openai" in exc_module or "anthropic" in exc_module or "httpx" in exc_module:
+-            logger.exception("Onboarding LLM connection error: %s", exc)
+-            raise HTTPException(status_code=503, detail="LLM service unavailable") from exc
+-        raise
++    except LLM_ERRORS as exc:
++        logger.exception("Onboarding LLM request failed")
++        raise HTTPException(status_code=503, detail="LLM service unavailable") from exc
+ 
+     complete = bool(ctx.metadata.get("onboarding_complete"))
+     actions: list[dict] = list(ctx.actions)
+diff --git a/apps/api/routers/preferences_llm.py b/apps/api/routers/preferences_llm.py
+index 3e318ea..df098af 100644
+--- a/apps/api/routers/preferences_llm.py
++++ b/apps/api/routers/preferences_llm.py
+@@ -3,6 +3,7 @@
+ import json
+ import logging
+ 
++
+ from fastapi import APIRouter, Depends
+ from libs.exceptions import ExternalServiceError, ValidationError
+ from sqlalchemy.ext.asyncio import AsyncSession
+@@ -20,6 +21,8 @@ from schemas.preference import (
+ from services.auth.dependency import get_current_user
+ from services.llm.local_config import get_llm_runtime_config, get_ollama_models, test_llm_connection
+ 
++import httpx
++
+ logger = logging.getLogger(__name__)
+ 
+ router = APIRouter()
+@@ -67,10 +70,9 @@ async def list_ollama_models(
+     _ = user
+     try:
+         return await get_ollama_models(base_url)
+-    except (ConnectionError, OSError, TimeoutError, ValueError) as exc:
++    except (httpx.HTTPError, OSError, ValueError) as exc:
++        logger.exception("Failed to fetch Ollama models")
+         raise ExternalServiceError(service="Ollama", message=f"Cannot reach Ollama: {exc}") from exc
+-    except Exception as exc:
+-        raise ExternalServiceError(service="Ollama", message=f"Ollama request failed: {exc}") from exc
+ 
+ 
+ # ── NL Preference Parsing ──
+diff --git a/apps/api/routers/scrape.py b/apps/api/routers/scrape.py
+index 84b5f8c..d036b1e 100644
+--- a/apps/api/routers/scrape.py
++++ b/apps/api/routers/scrape.py
+@@ -1,6 +1,9 @@
+ """Scrape source management — CRUD for watched URLs + auth sessions."""
+ 
+ import uuid
++import logging
++
++logger = logging.getLogger(__name__)
+ from datetime import datetime, timezone
+ from urllib.parse import urlparse
+ 
+@@ -218,7 +221,7 @@ async def auth_login(
+     """Login to an auth domain and save the session via Playwright."""
+     from services.browser.session_manager import SessionManager
+     try:
+-        from playwright.async_api import async_playwright
++        from playwright.async_api import Error as PlaywrightError, async_playwright
+     except ImportError as exc:
+         raise HTTPException(status_code=503, detail="Playwright is required for browser login but is not installed") from exc
+ 
+@@ -231,12 +234,9 @@ async def auth_login(
+                 browser, session_name, str(body.login_url), body.actions,
+             )
+             await browser.close()
+-    except (OSError, RuntimeError, ConnectionError, TimeoutError) as exc:
++    except (PlaywrightError, OSError, RuntimeError) as exc:
++        logger.exception("Browser login failed")
+         raise HTTPException(status_code=502, detail=f"Browser automation failed: {exc}") from exc
+-    except Exception as exc:
+-        if "playwright" in type(exc).__module__:
+-            raise HTTPException(status_code=502, detail=f"Browser automation failed: {exc}") from exc
+-        raise
+ 
+     if not success:
+         raise HTTPException(status_code=401, detail="Authentication failed")
+@@ -303,7 +303,7 @@ async def validate_auth_session(
+         raise NotFoundError("Auth session")
+ 
+     try:
+-        from playwright.async_api import async_playwright
++        from playwright.async_api import Error as PlaywrightError, async_playwright
+     except ImportError as exc:
+         raise HTTPException(status_code=503, detail="Playwright is required but not installed") from exc
+ 
+@@ -320,12 +320,9 @@ async def validate_auth_session(
+                 failure_selector=auth_session.failure_selector,
+             )
+             await browser.close()
+-    except (OSError, RuntimeError, ConnectionError, TimeoutError) as exc:
++    except (PlaywrightError, OSError, RuntimeError) as exc:
++        logger.exception("Session validation failed")
+         raise HTTPException(status_code=502, detail=f"Session validation failed: {exc}") from exc
+-    except Exception as exc:
+-        if "playwright" in type(exc).__module__:
+-            raise HTTPException(status_code=502, detail=f"Session validation failed: {exc}") from exc
+-        raise
+ 
+     auth_session.is_valid = is_valid
+     auth_session.last_validated_at = datetime.now(timezone.utc)
+diff --git a/apps/api/routers/upload.py b/apps/api/routers/upload.py
+index 5df3141..36df481 100644
+--- a/apps/api/routers/upload.py
++++ b/apps/api/routers/upload.py
+@@ -109,8 +109,10 @@ async def upload_file(
+             file_bytes=file_bytes,
+         )
+         await db.commit()
++    # Cleanup must run for any ingestion failure, including programming errors;
++    # re-raise unchanged so the request error remains visible.
+     except Exception:
+-        # Clean up saved file if ingestion fails, then re-raise the original error.
++        logger.exception("Upload ingestion failed for file=%s", file.filename)
+         try:
+             os.remove(save_path)
+         except OSError:
+diff --git a/apps/api/services/activity/engine.py b/apps/api/services/activity/engine.py
+index c330138..8cf71a0 100644
+--- a/apps/api/services/activity/engine.py
++++ b/apps/api/services/activity/engine.py
+@@ -19,6 +19,7 @@ from __future__ import annotations
+ import asyncio
+ import logging
+ 
++
+ from config import settings
+ from services.activity.redis_notify import (
+     close_redis as _close_redis_notify,
+@@ -85,6 +86,8 @@ from services.activity.engine_queries import (  # noqa: F401
+     submit_task,
+ )
+ 
++from sqlalchemy.exc import SQLAlchemyError
++
+ logger = logging.getLogger(__name__)
+ 
+ # ── Constants ─────────────────────────────────────────────────────
+@@ -140,8 +143,10 @@ async def _wait_with_redis_or_stop(timeout: float) -> bool:
+     for task in done:
+         try:
+             return task.result()
++        # Optional Redis backends may raise library-specific errors. Fall back
++        # to database polling without stopping the worker.
+         except Exception as e:
+-            logger.debug("Redis/stop wait task raised: %s", e)
++            logger.warning("Redis/stop wait task raised: %s", e, exc_info=True)
+             return False
+     return False
+ 
+@@ -159,7 +164,7 @@ async def _run_loop() -> None:
+         try:
+             # Claim up to max_concurrency tasks in one batch.
+             ids = await _claim_pending_tasks(max_concurrency)
+-        except Exception as e:
++        except (SQLAlchemyError, OSError) as e:
+             logger.exception("Activity engine: failed to claim tasks: %s", e)
+             ids = []
+ 
+diff --git a/apps/api/services/activity/engine_execution.py b/apps/api/services/activity/engine_execution.py
+index cd36392..bf334cb 100644
+--- a/apps/api/services/activity/engine_execution.py
++++ b/apps/api/services/activity/engine_execution.py
+@@ -190,6 +190,8 @@ async def execute_task(task_id: uuid.UUID) -> bool:
+             task_id, error_message=str(exc),
+             result_payload=exc.result_payload, summary=exc.summary,
+         )
++    # Task dispatch invokes arbitrary agent/tools; every failure must mark the
++    # durable task failed rather than leave it stuck in running.
+     except Exception as exc:
+         logger.exception("Agent task failed: %s (%s)", task_id, exc)
+         return await _mark_task_failure(task_id, str(exc))
+diff --git a/apps/api/services/activity/engine_multistep.py b/apps/api/services/activity/engine_multistep.py
+index ced448c..c338993 100644
+--- a/apps/api/services/activity/engine_multistep.py
++++ b/apps/api/services/activity/engine_multistep.py
+@@ -30,6 +30,8 @@ from services.activity.engine_helpers import (
+ )
+ from services.activity.engine_lifecycle import _record_task_audit
+ 
++from services.llm.errors import LLM_ERRORS
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -135,7 +137,7 @@ async def _queue_auto_repair_follow_up(
+         except (ConnectionError, TimeoutError, ValueError, RuntimeError, OSError) as exc:
+             logger.warning("Auto repair follow-up planning failed for task %s: %s", task.id, exc)
+             return None
+-        except Exception as exc:  # noqa: BLE001 — LLM API errors (openai.APIError, httpx.*) aren't stdlib
++        except LLM_ERRORS as exc:
+             logger.warning("Auto repair planning failed (API error) for task %s: %s", task.id, exc)
+             return None
+         input_json.update({
+diff --git a/apps/api/services/agent/agenda.py b/apps/api/services/agent/agenda.py
+index c241b38..1ac04ed 100644
+--- a/apps/api/services/agent/agenda.py
++++ b/apps/api/services/agent/agenda.py
+@@ -24,6 +24,9 @@ from services.activity.engine import resume_task, retry_task, submit_task
+ from services.agent.agenda_ranking import AgendaDecision, rank_signals
+ from services.agent.agenda_signals import AgendaSignal, collect_signals
+ 
++from sqlalchemy.exc import SQLAlchemyError
++from services.llm.errors import LLM_ERRORS
++
+ logger = logging.getLogger(__name__)
+ 
+ # ---------------------------------------------------------------------------
+@@ -109,7 +112,7 @@ async def run_agenda_tick(
+             if notify and task and decision.action == "submit":
+                 logger.debug("Notification skipped (removed): %s", decision.task_title)
+ 
+-    except Exception as exc:
++    except (SQLAlchemyError, *LLM_ERRORS, OSError, ValueError, RuntimeError) as exc:
+         logger.exception("Agenda tick failed for user=%s course=%s", user_id, course_id)
+         run.status = "failed"
+         run.error_message = str(exc)[:500]
+diff --git a/apps/api/services/agent/background_runtime.py b/apps/api/services/agent/background_runtime.py
+index 830723a..8bd442b 100644
+--- a/apps/api/services/agent/background_runtime.py
++++ b/apps/api/services/agent/background_runtime.py
+@@ -42,6 +42,8 @@ async def _retry_async(coro_fn, name: str, max_retries: int = 2, base_delay: flo
+         try:
+             await coro_fn()
+             return {"success": True, "name": name}
++        # Post-process callbacks are extensible; isolate failures and return a
++        # recorded result after retries without interrupting other callbacks.
+         except Exception as exc:
+             if attempt == max_retries:
+                 logger.exception("Post-process '%s' failed after %d retries: %s", name, max_retries, exc)
+diff --git a/apps/api/services/agent/base.py b/apps/api/services/agent/base.py
+index 0bb351c..38c1504 100644
+--- a/apps/api/services/agent/base.py
++++ b/apps/api/services/agent/base.py
+@@ -72,6 +72,8 @@ class BaseAgent(DelegationMixin, BackgroundTaskMixin, PromptBuildingMixin, ABC):
+         try:
+             ctx = await self.execute(ctx, db)
+             return ctx
++        # Specialist agents implement arbitrary execute() methods; translate any
++        # failure into the common failed-context contract.
+         except Exception as e:
+             logger.exception("Agent %s failed: %s", self.name, e)
+             ctx.mark_failed(str(e))
+diff --git a/apps/api/services/agent/base_mixins.py b/apps/api/services/agent/base_mixins.py
+index fc29e5c..117623f 100644
+--- a/apps/api/services/agent/base_mixins.py
++++ b/apps/api/services/agent/base_mixins.py
+@@ -107,6 +107,8 @@ class DelegationMixin:
+                     "duration_ms": round(elapsed, 1),
+                     "tool_calls": [],
+                 }
++            # Independent agent branches must report failures without aborting
++            # successful siblings, including errors in custom agents.
+             except Exception as e:
+                 elapsed = (time.monotonic() - start) * 1000
+                 logger.exception(
+diff --git a/apps/api/services/agent/extensions.py b/apps/api/services/agent/extensions.py
+index baf60c4..ac1b045 100644
+--- a/apps/api/services/agent/extensions.py
++++ b/apps/api/services/agent/extensions.py
+@@ -110,6 +110,8 @@ class ExtensionRegistry:
+         for ext in extensions:
+             try:
+                 await ext.on_hook(hook, ctx, **kwargs)
++            # Third-party hooks may raise arbitrary exceptions; isolate the hook
++            # so other extensions and the conversation can continue.
+             except Exception as e:
+                 logger.exception(
+                     "Extension '%s' failed on hook '%s': %s",
+diff --git a/apps/api/services/agent/orchestrator.py b/apps/api/services/agent/orchestrator.py
+index f2cb5fb..81f023e 100644
+--- a/apps/api/services/agent/orchestrator.py
++++ b/apps/api/services/agent/orchestrator.py
+@@ -264,6 +264,8 @@ async def orchestrate_simple(user_id, message: str, channel: str = "api", db=Non
+                 db=session, db_factory=async_session, post_process_inline=True,
+             )
+             return ctx.response or "I couldn't process that. Please try again."
++    # External channels need a textual failure response for arbitrary agent
++    # failures; the traceback remains available in the server log.
+     except Exception as e:
+         logger.exception("orchestrate_simple failed (channel=%s): %s", channel, e)
+         return "Sorry, I encountered an error. Please try again later."
+diff --git a/apps/api/services/agent/sandbox_runner.py b/apps/api/services/agent/sandbox_runner.py
+index f224ebf..3af9fb6 100644
+--- a/apps/api/services/agent/sandbox_runner.py
++++ b/apps/api/services/agent/sandbox_runner.py
+@@ -6,6 +6,7 @@ import builtins
+ import contextlib
+ import io
+ import json
++import logging
+ import os
+ import resource
+ import signal
+@@ -83,7 +84,10 @@ def main() -> int:
+             "error": stderr_buf.getvalue()[:500],
+         }))
+         return 0
++    # Student code can raise any exception; preserve the sandbox JSON protocol
++    # while writing diagnostics to stderr rather than corrupting stdout.
+     except Exception as exc:
++        logging.getLogger(__name__).exception("Sandbox execution failed")
+         sys.stdout.write(json.dumps({
+             "success": False,
+             "output": "",
+diff --git a/apps/api/services/agent/tools/registry.py b/apps/api/services/agent/tools/registry.py
+index 24a1cf9..ab27227 100644
+--- a/apps/api/services/agent/tools/registry.py
++++ b/apps/api/services/agent/tools/registry.py
+@@ -16,6 +16,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+ from services.agent.tools.base import Tool, ToolResult
+ 
++from libs.exceptions import AppError
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -115,6 +117,8 @@ class ToolRegistry:
+                 ctx._idem_cache[idem_key] = truncated
+ 
+             return truncated
++        except AppError:
++            raise
+         except (ValueError, KeyError, TypeError) as e:
+             logger.exception("Tool '%s' failed with data error: %s", name, e)
+             return ToolResult(success=False, output="", error=f"Tool error: {e}")
+@@ -124,10 +128,9 @@ class ToolRegistry:
+         except (ConnectionError, TimeoutError, OSError) as e:
+             logger.exception("Tool '%s' failed with network/IO error: %s", name, e)
+             return ToolResult(success=False, output="", error=f"Tool error: {e}")
++        # User-registered tools may raise arbitrary exceptions; return a tool failure
++        # so one tool cannot abort the entire conversation.
+         except Exception as e:
+-            from libs.exceptions import AppError
+-            if isinstance(e, AppError):
+-                raise
+             logger.exception("Tool '%s' failed with unexpected error: %s", name, e)
+             return ToolResult(success=False, output="", error=f"Tool error: {e}")
+ 
+diff --git a/apps/api/services/block_decision/preference.py b/apps/api/services/block_decision/preference.py
+index f470a1d..6fd5d94 100644
+--- a/apps/api/services/block_decision/preference.py
++++ b/apps/api/services/block_decision/preference.py
+@@ -15,6 +15,8 @@ from datetime import datetime, timezone
+ from sqlalchemy import select
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
++from sqlalchemy.exc import SQLAlchemyError
++
+ logger = logging.getLogger(__name__)
+ 
+ # Scoring weights for different event types
+@@ -61,8 +63,9 @@ async def record_block_event(
+         )
+         db.add(signal)
+         await db.flush()
+-    except Exception as e:
+-        logger.warning("Failed to record block event: %s", e)
++    except SQLAlchemyError as e:
++        logger.warning("Failed to record block event for user=%s course=%s: %s",
++                       user_id, course_id, e, exc_info=True)
+ 
+ 
+ # Onboarding preference dimension -> block types they boost
+@@ -94,8 +97,9 @@ async def _load_onboarding_boosts(
+             )
+         )
+         prefs = result.scalars().all()
+-    except Exception as e:
+-        logger.warning("Failed to load onboarding preferences: %s", e)
++    except SQLAlchemyError as e:
++        logger.warning("Failed to load onboarding preferences for user=%s: %s",
++                       user_id, e, exc_info=True)
+         return {}
+ 
+     boosts: dict[str, float] = {}
+@@ -137,8 +141,9 @@ async def compute_block_preferences(
+             .limit(SIGNAL_QUERY_LIMIT)
+         )
+         signals = result.scalars().all()
+-    except Exception as e:
+-        logger.warning("Failed to query block preferences: %s", e)
++    except SQLAlchemyError as e:
++        logger.warning("Failed to query block preferences for user=%s course=%s: %s",
++                       user_id, course_id, e, exc_info=True)
+         signals = []
+ 
+     now = datetime.now(timezone.utc)
+diff --git a/apps/api/services/browser/automation.py b/apps/api/services/browser/automation.py
+index 203de6f..b560e98 100644
+--- a/apps/api/services/browser/automation.py
++++ b/apps/api/services/browser/automation.py
+@@ -10,6 +10,8 @@ Reference: spec Phase 3 — 3-layer browser cascade.
+ import asyncio
+ import logging
+ 
++from libs.exceptions import ValidationError
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -18,7 +20,7 @@ async def fetch_with_httpx(url: str, cookies: dict | None = None) -> str | None:
+     try:
+         from libs.url_validation import validate_url
+         validate_url(url)
+-    except Exception as e:
++    except (ValidationError, ValueError) as e:
+         logger.warning("URL validation failed for %s: %s", url, e)
+         return None
+     try:
+@@ -73,13 +75,18 @@ async def fetch_with_browser(
+     try:
+         from libs.url_validation import validate_url
+         validate_url(url)
+-    except Exception as e:
++    except (ValidationError, ValueError) as e:
+         logger.warning("URL validation failed for %s: %s", url, e)
+         return None
+     try:
+-        from playwright.async_api import async_playwright
+-        from services.browser.session_manager import SessionManager
++        from playwright.async_api import Error as PlaywrightError, async_playwright
++    except ImportError:
++        logger.warning("Playwright not installed. Run: pip install playwright && playwright install")
++        return None
++
++    from services.browser.session_manager import SessionManager
+ 
++    try:
+         async with async_playwright() as p:
+             browser = await p.chromium.launch(headless=True)
+             context = await SessionManager.create_context_with_state(browser, session_name)
+@@ -110,13 +117,7 @@ async def fetch_with_browser(
+ 
+             return content
+ 
+-    except ImportError:
+-        logger.warning("Playwright not installed. Run: pip install playwright && playwright install")
+-        return None
+-    except (OSError, RuntimeError, ConnectionError, TimeoutError) as e:
+-        logger.exception("Browser automation failed for %s", url)
+-        return None
+-    except Exception as e:
++    except (PlaywrightError, OSError, RuntimeError, KeyError):
+         logger.exception("Browser automation failed for %s", url)
+         return None
+ 
+diff --git a/apps/api/services/cognitive_load.py b/apps/api/services/cognitive_load.py
+index 7b79ec4..715b56e 100644
+--- a/apps/api/services/cognitive_load.py
++++ b/apps/api/services/cognitive_load.py
+@@ -334,7 +334,8 @@ async def compute_cognitive_load(
+     try:
+         from services.cognitive_load_tuning import update_and_get_multipliers
+         weight_multipliers = update_and_get_multipliers(str(user_id), signals)
+-    except Exception:  # noqa: BLE001
++    except (ImportError, ValueError, OverflowError):
++        logger.warning("Cognitive load tuning unavailable for user=%s", user_id, exc_info=True)
+         weight_multipliers = {}
+ 
+     return {
+diff --git a/apps/api/services/ingestion/auto_generation/notes.py b/apps/api/services/ingestion/auto_generation/notes.py
+index 9a01bdd..6428d70 100644
+--- a/apps/api/services/ingestion/auto_generation/notes.py
++++ b/apps/api/services/ingestion/auto_generation/notes.py
+@@ -5,6 +5,8 @@ import uuid
+ 
+ from sqlalchemy import select
+ 
++from services.llm.errors import LLM_ERRORS
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -56,7 +58,7 @@ async def auto_generate_notes(
+                 logger.warning("Auto-generate notes network error for '%s': %s", node.title, e)
+             except (ValueError, RuntimeError) as e:
+                 logger.exception("Auto-generate notes unexpected error for '%s'", node.title)
+-            except Exception as e:
++            except LLM_ERRORS:
+                 logger.exception("Auto-generate notes failed for '%s'", node.title)
+             return None
+ 
+diff --git a/apps/api/services/ingestion/auto_generation/orchestrator.py b/apps/api/services/ingestion/auto_generation/orchestrator.py
+index 6796529..93d76ce 100644
+--- a/apps/api/services/ingestion/auto_generation/orchestrator.py
++++ b/apps/api/services/ingestion/auto_generation/orchestrator.py
+@@ -12,6 +12,8 @@ from services.ingestion.auto_generation.practice import (
+ )
+ from services.ingestion.auto_generation.configure import auto_configure_course
+ 
++from services.llm.errors import LLM_ERRORS
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -30,21 +32,21 @@ async def auto_prepare(
+     async def _safe_notes() -> tuple[int, str | None]:
+         try:
+             return (await auto_generate_notes(db_factory, course_id, user_id), None)
+-        except Exception as e:
++        except (sa.exc.SQLAlchemyError, *LLM_ERRORS, OSError, ValueError, RuntimeError) as e:
+             logger.exception("auto_prepare: notes step failed")
+             return (0, str(e))
+ 
+     async def _safe_flashcards() -> tuple[int, str | None]:
+         try:
+             return (await auto_generate_flashcards(db_factory, course_id, user_id), None)
+-        except Exception as e:
++        except (sa.exc.SQLAlchemyError, *LLM_ERRORS, OSError, ValueError, RuntimeError) as e:
+             logger.exception("auto_prepare: flashcards step failed")
+             return (0, str(e))
+ 
+     async def _safe_quiz() -> tuple[int, str | None]:
+         try:
+             return (await auto_generate_quiz(db_factory, course_id), None)
+-        except Exception as e:
++        except (sa.exc.SQLAlchemyError, *LLM_ERRORS, OSError, ValueError, RuntimeError) as e:
+             logger.exception("auto_prepare: quiz step failed")
+             return (0, str(e))
+ 
+diff --git a/apps/api/services/ingestion/document_loader_formats.py b/apps/api/services/ingestion/document_loader_formats.py
+index abaa544..14756c6 100644
+--- a/apps/api/services/ingestion/document_loader_formats.py
++++ b/apps/api/services/ingestion/document_loader_formats.py
+@@ -13,8 +13,12 @@ Extracted from document_loader.py.
+ 
+ import csv
+ import logging
++
+ from pathlib import Path
+ 
++from zipfile import BadZipFile
++from xml.etree.ElementTree import ParseError
++
+ logger = logging.getLogger(__name__)
+ 
+ # Office formats handled by loader_dict (GPT-Researcher pattern)
+@@ -338,8 +342,8 @@ def _extract_xlsx_fallback(file_path: str) -> tuple[str, str]:
+         logger.debug("openpyxl not installed for XLSX extraction of %s", file_path)
+     except (OSError, ValueError, KeyError) as e:
+         logger.warning("XLSX extraction failed for %s: %s", Path(file_path).name, e)
+-    except Exception as e:
+-        logger.warning("XLSX extraction unexpected error for %s: %s", Path(file_path).name, e)
++    except (BadZipFile, ParseError, SyntaxError) as e:
++        logger.warning("Invalid XLSX document %s: %s", Path(file_path).name, e, exc_info=True)
+ 
+     return Path(file_path).stem, ""
+ 
+diff --git a/apps/api/services/ingestion/pipeline.py b/apps/api/services/ingestion/pipeline.py
+index 36fb420..b41fee7 100644
+--- a/apps/api/services/ingestion/pipeline.py
++++ b/apps/api/services/ingestion/pipeline.py
+@@ -242,8 +242,9 @@ async def run_ingestion_pipeline(
+                                     "Canvas Playwright fallback succeeded: %d chars for %s",
+                                     len(extracted), url,
+                                 )
+-                    except Exception as fb_exc:
+-                        logger.debug("Canvas Playwright fallback also failed: %s", fb_exc)
++                    except (ImportError, OSError, ValueError, RuntimeError) as fb_exc:
++                        logger.warning("Canvas browser fallback failed for job=%s: %s",
++                                       job.id, fb_exc, exc_info=True)
+ 
+                     if not _playwright_fallback_ok:
+                         # Both approaches failed — mark session as expired and fail the job.
+diff --git a/apps/api/services/llm/errors.py b/apps/api/services/llm/errors.py
+new file mode 100644
+index 0000000..321fecd
+--- /dev/null
++++ b/apps/api/services/llm/errors.py
+@@ -0,0 +1,14 @@
++"""Concrete transport and SDK errors shared by LLM consumers."""
++
++import httpx
++import openai
++
++LLM_ERRORS: tuple[type[Exception], ...] = (openai.APIError, httpx.HTTPError)
++
++# Anthropic is optional in the core installation.
++try:
++    import anthropic
++except ImportError:
++    pass
++else:
++    LLM_ERRORS += (anthropic.APIError,)
+diff --git a/apps/api/services/llm/litellm_client.py b/apps/api/services/llm/litellm_client.py
+index 1524c29..686be9a 100644
+--- a/apps/api/services/llm/litellm_client.py
++++ b/apps/api/services/llm/litellm_client.py
+@@ -85,7 +85,10 @@ class LiteLLMClient(LLMClient):
+         except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as e:
+             self.mark_unhealthy(str(e))
+             raise
+-        except Exception as e:  # Catch-all: litellm may raise provider-specific errors
++        # LiteLLM supports third-party providers with unrelated error hierarchies.
++        # Record health but re-raise unchanged so unexpected failures stay visible.
++        except Exception as e:
++            logger.exception("LiteLLM request failed for model=%s", self.model)
+             self.mark_unhealthy(str(e))
+             raise
+ 
+@@ -120,7 +123,10 @@ class LiteLLMClient(LLMClient):
+         except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as e:
+             self.mark_unhealthy(str(e))
+             raise
+-        except Exception as e:  # Catch-all: litellm may raise provider-specific errors
++        # LiteLLM supports third-party providers with unrelated error hierarchies.
++        # Record health but re-raise unchanged so unexpected failures stay visible.
++        except Exception as e:
++            logger.exception("LiteLLM request failed for model=%s", self.model)
+             self.mark_unhealthy(str(e))
+             raise
+ 
+@@ -176,6 +182,9 @@ class LiteLLMClient(LLMClient):
+         except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as e:
+             self.mark_unhealthy(str(e))
+             raise
+-        except Exception as e:  # Catch-all: litellm may raise provider-specific errors
++        # LiteLLM supports third-party providers with unrelated error hierarchies.
++        # Record health but re-raise unchanged so unexpected failures stay visible.
++        except Exception as e:
++            logger.exception("LiteLLM request failed for model=%s", self.model)
+             self.mark_unhealthy(str(e))
+             raise
+diff --git a/apps/api/services/llm/providers/openai_client.py b/apps/api/services/llm/providers/openai_client.py
+index e51352e..44ccfea 100644
+--- a/apps/api/services/llm/providers/openai_client.py
++++ b/apps/api/services/llm/providers/openai_client.py
+@@ -75,9 +75,11 @@ class OpenAIClient(LLMClient):
+             self.mark_unhealthy("timeout")
+             return False
+         except httpx.HTTPStatusError as e:
++            logger.warning("OpenAI model probe failed", exc_info=True)
+             self.mark_unhealthy(f"probe_error: {e}")
+             return False
+-        except Exception as e:  # Catch-all: unexpected probe failures
++        except (httpx.HTTPError, OSError, ValueError) as e:
++            logger.warning("OpenAI model probe failed", exc_info=True)
+             self.mark_unhealthy(f"probe_error: {e}")
+             return False
+ 
+diff --git a/apps/api/services/llm/router.py b/apps/api/services/llm/router.py
+index 6da1db6..e945077 100644
+--- a/apps/api/services/llm/router.py
++++ b/apps/api/services/llm/router.py
+@@ -202,8 +202,10 @@ class ProviderRegistry:
+                 "latency_ms": round(elapsed, 1),
+                 "checked_at": time.time(),
+             }
+-        except Exception as e:  # Catch-all: wraps arbitrary probe failures into health status dict
+-            logger.debug("Provider %s probe failed: %s", name, e)
++        # Registered providers may implement arbitrary probes. One failed probe
++        # must return a health status without aborting checks of other providers.
++        except Exception as e:
++            logger.warning("Provider %s probe failed: %s", name, e, exc_info=True)
+             elapsed = (time.time() - start) * 1000
+             return {
+                 "healthy": False,
+diff --git a/apps/api/services/memory/pipeline.py b/apps/api/services/memory/pipeline.py
+index 9394c60..0b11e61 100644
+--- a/apps/api/services/memory/pipeline.py
++++ b/apps/api/services/memory/pipeline.py
+@@ -16,6 +16,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
+ from models.memory import ConversationMemory
+ from services.search.compat import update_search_vector
+ 
++from sqlalchemy.exc import SQLAlchemyError
++
+ logger = logging.getLogger(__name__)
+ 
+ try:
+@@ -218,8 +220,9 @@ async def generate_teaching_state(
+             "total_concepts": total_count,
+             "review_urgency": review_urgency,
+         }
+-    except Exception:
+-        logger.warning("Teaching state generation failed", exc_info=True)
++    except (SQLAlchemyError, ValueError, TypeError, KeyError):
++        logger.warning("Teaching state generation failed for user=%s course=%s",
++                       user_id, course_id, exc_info=True)
+         return None
+ 
+ 
+diff --git a/apps/api/services/scheduler/engine_jobs_maintenance.py b/apps/api/services/scheduler/engine_jobs_maintenance.py
+index 4e982df..3c7c7f8 100644
+--- a/apps/api/services/scheduler/engine_jobs_maintenance.py
++++ b/apps/api/services/scheduler/engine_jobs_maintenance.py
+@@ -440,15 +440,12 @@ async def canvas_session_keepalive_job():
+                         session.session_name, e,
+                     )
+                     skipped += 1
+-                except Exception as e:  # httpx errors
+-                    if "httpx" in type(e).__module__ or "anyio" in type(e).__module__:
+-                        logger.warning(
+-                            "Canvas keep-alive HTTP error for %s: %s",
+-                            session.session_name, e,
+-                        )
+-                        skipped += 1
+-                    else:
+-                        raise
++                except httpx.HTTPError as e:
++                    logger.warning(
++                        "Canvas keep-alive HTTP error for %s: %s",
++                        session.session_name, e, exc_info=True,
++                    )
++                    skipped += 1
+ 
+             await db.commit()
+ 
+diff --git a/tests/test_canvas_router_unit.py b/tests/test_canvas_router_unit.py
+index 06495cb..19036e6 100644
+--- a/tests/test_canvas_router_unit.py
++++ b/tests/test_canvas_router_unit.py
+@@ -59,6 +59,7 @@ def _mock_playwright(monkeypatch):
+             return False
+ 
+     async_api = types.ModuleType("playwright.async_api")
++    async_api.Error = type("PlaywrightError", (Exception,), {})
+     async_api.async_playwright = lambda: _CM()
+     playwright_pkg = types.ModuleType("playwright")
+     playwright_pkg.async_api = async_api
+diff --git a/tests/test_exception_handling_regressions.py b/tests/test_exception_handling_regressions.py
+new file mode 100644
+index 0000000..e4b2b4b
+--- /dev/null
++++ b/tests/test_exception_handling_regressions.py
+@@ -0,0 +1,160 @@
++"""Expected failures degrade gracefully; programming errors remain visible."""
++
++import json
++import logging
++import sys
++import types
++import uuid
++from types import SimpleNamespace
++from unittest.mock import AsyncMock
++from zipfile import BadZipFile
++
++import httpx
++import pytest
++from sqlalchemy.exc import SQLAlchemyError
++
++from libs.exceptions import ExternalServiceError, ValidationError
++from libs.text_utils import parse_llm_json
++from routers import preferences_llm
++from services.block_decision import preference
++from services.browser import automation
++from services.ingestion.document_loader_formats import _extract_xlsx_fallback
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("operation", ["record", "onboarding", "preferences"])
++async def test_preference_database_failures_are_logged(operation, caplog):
++    user_id, course_id = uuid.uuid4(), uuid.uuid4()
++    db = SimpleNamespace(
++        add=lambda _: None,
++        flush=AsyncMock(side_effect=SQLAlchemyError("database unavailable")),
++        execute=AsyncMock(side_effect=SQLAlchemyError("database unavailable")),
++    )
++    with caplog.at_level(logging.WARNING):
++        if operation == "record":
++            assert (
++                await preference.record_block_event(
++                    db, user_id, course_id, "view", "notes"
++                )
++                is None
++            )
++        elif operation == "onboarding":
++            assert await preference._load_onboarding_boosts(db, user_id) == {}
++        else:
++            assert (
++                await preference.compute_block_preferences(db, user_id, course_id) == {}
++            )
++    assert str(user_id) in caplog.text
++    assert "database unavailable" in caplog.text
++    assert any(record.exc_info for record in caplog.records)
++
++
++@pytest.mark.asyncio
++async def test_preference_programming_errors_propagate():
++    db = SimpleNamespace(execute=AsyncMock(side_effect=AttributeError("bad query")))
++    with pytest.raises(AttributeError, match="bad query"):
++        await preference._load_onboarding_boosts(db, uuid.uuid4())
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    "fetch", [automation.fetch_with_httpx, automation.fetch_with_browser]
++)
++async def test_invalid_url_is_logged_without_network_access(fetch, monkeypatch, caplog):
++    def reject(_):
++        raise ValidationError("blocked URL")
++
++    monkeypatch.setattr("libs.url_validation.validate_url", reject)
++    with caplog.at_level(logging.WARNING):
++        assert await fetch("https://example.com") is None
++    assert "URL validation failed" in caplog.text
++
++
++@pytest.mark.asyncio
++async def test_url_validator_programming_error_propagates(monkeypatch):
++    def broken(_):
++        raise AttributeError("validator bug")
++
++    monkeypatch.setattr("libs.url_validation.validate_url", broken)
++    with pytest.raises(AttributeError, match="validator bug"):
++        await automation.fetch_with_httpx("https://example.com")
++
++
++@pytest.mark.asyncio
++async def test_browser_catches_playwright_error_but_not_programming_error(
++    monkeypatch, caplog
++):
++    class PlaywrightError(Exception):
++        pass
++
++    module = types.ModuleType("playwright.async_api")
++    module.Error = PlaywrightError
++    module.async_playwright = lambda: (_ for _ in ()).throw(
++        PlaywrightError("browser closed")
++    )
++    package = types.ModuleType("playwright")
++    package.async_api = module
++    monkeypatch.setitem(sys.modules, "playwright", package)
++    monkeypatch.setitem(sys.modules, "playwright.async_api", module)
++    monkeypatch.setattr("libs.url_validation.validate_url", lambda url: url)
++    with caplog.at_level(logging.ERROR):
++        assert await automation.fetch_with_browser("https://example.com") is None
++    assert "browser closed" in caplog.text
++    module.async_playwright = lambda: (_ for _ in ()).throw(
++        AttributeError("browser bug")
++    )
++    with pytest.raises(AttributeError, match="browser bug"):
++        await automation.fetch_with_browser("https://example.com")
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    "error",
++    [
++        httpx.ConnectError("offline"),
++        json.JSONDecodeError("invalid response", "{", 1),
++    ],
++)
++async def test_ollama_expected_errors_preserve_service_error(
++    error, monkeypatch, caplog
++):
++    monkeypatch.setattr(
++        preferences_llm, "get_ollama_models", AsyncMock(side_effect=error)
++    )
++    with caplog.at_level(logging.ERROR), pytest.raises(ExternalServiceError) as caught:
++        await preferences_llm.list_ollama_models(base_url=None, user=SimpleNamespace())
++    assert caught.value.__cause__ is error
++    assert "Failed to fetch Ollama models" in caplog.text
++
++
++@pytest.mark.asyncio
++async def test_ollama_programming_errors_propagate(monkeypatch):
++    monkeypatch.setattr(
++        preferences_llm,
++        "get_ollama_models",
++        AsyncMock(side_effect=AttributeError("response bug")),
++    )
++    with pytest.raises(AttributeError, match="response bug"):
++        await preferences_llm.list_ollama_models(base_url=None, user=SimpleNamespace())
++
++
++def test_json_fallback_logs_diagnostics_without_response_content(caplog):
++    with caplog.at_level(logging.DEBUG):
++        assert parse_llm_json("private student response {broken}", default=[]) == []
++    assert "parse failed" in caplog.text
++    assert "private student response" not in caplog.text
++
++
++@pytest.mark.parametrize("error", [BadZipFile("bad archive"), SyntaxError("bad XML")])
++def test_corrupt_xlsx_is_logged_and_returns_empty_content(error, monkeypatch, caplog):
++    module = types.ModuleType("openpyxl")
++
++    def fail(*args, **kwargs):
++        raise error
++
++    module.load_workbook = fail
++    monkeypatch.setitem(sys.modules, "openpyxl", module)
++    with caplog.at_level(logging.WARNING):
++        assert _extract_xlsx_fallback("lecture.xlsx") == ("lecture", "")
++    assert "Invalid XLSX document lecture.xlsx" in caplog.text
++    assert any(record.exc_info for record in caplog.records)
+diff --git a/tests/test_scrape_router_unit.py b/tests/test_scrape_router_unit.py
+index ce12900..c77dac9 100644
+--- a/tests/test_scrape_router_unit.py
++++ b/tests/test_scrape_router_unit.py
+@@ -237,6 +237,7 @@ def _mock_playwright_module(monkeypatch):
+             return False
+ 
+     async_api = types.ModuleType("playwright.async_api")
++    async_api.Error = type("PlaywrightError", (Exception,), {})
+     async_api.async_playwright = lambda: _AsyncPlaywrightCM()
+     playwright_pkg = types.ModuleType("playwright")
+     playwright_pkg.async_api = async_api
